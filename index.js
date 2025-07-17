@@ -2,10 +2,51 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs-extra");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Configuração do multer para upload de arquivos
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const uploadPath = path.join(__dirname, 'uploads');
+    fs.ensureDirSync(uploadPath);
+    cb(null, uploadPath);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const extension = path.extname(file.originalname);
+    cb(null, file.fieldname + '-' + uniqueSuffix + extension);
+  }
+});
+
+const fileFilter = (req, file, cb) => {
+  // Aceitar apenas imagens, documentos e alguns outros tipos
+  const allowedTypes = [
+    'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+    'application/pdf', 'text/plain',
+    'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  ];
+
+  if (allowedTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error('Tipo de arquivo não permitido'), false);
+  }
+};
+
+const upload = multer({
+  storage: storage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB máximo
+  }
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -42,6 +83,50 @@ app.get('/api/rooms', (req, res) => {
   res.json(roomList);
 });
 
+// Route para upload de arquivos
+app.post('/api/upload', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Nenhum arquivo foi enviado' });
+    }
+
+    const fileInfo = {
+      filename: req.file.filename,
+      originalName: req.file.originalname,
+      size: req.file.size,
+      mimetype: req.file.mimetype,
+      url: `/uploads/${req.file.filename}`,
+      uploadDate: new Date().toISOString()
+    };
+
+    res.json({
+      success: true,
+      file: fileInfo
+    });
+  } catch (error) {
+    console.error('Erro no upload:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
+// Route para deletar arquivos
+app.delete('/api/upload/:filename', (req, res) => {
+  try {
+    const filename = req.params.filename;
+    const filePath = path.join(__dirname, 'uploads', filename);
+
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      res.json({ success: true, message: 'Arquivo deletado com sucesso' });
+    } else {
+      res.status(404).json({ error: 'Arquivo não encontrado' });
+    }
+  } catch (error) {
+    console.error('Erro ao deletar arquivo:', error);
+    res.status(500).json({ error: 'Erro interno do servidor' });
+  }
+});
+
 io.on("connection", (socket) => {
   let currentUser = null;
   let currentRoom = null;
@@ -61,11 +146,10 @@ io.on("connection", (socket) => {
     socket.emit("message_history", userMessages);
 
     sendUserLists();
-    console.log(`${username} conectou-se`);
   });
 
   // Enviar mensagem privada
-  socket.on("send_private", ({ to, message }) => {
+  socket.on("send_private", ({ to, message, fileData }) => {
     const timestamp = new Date().toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
@@ -76,6 +160,7 @@ io.on("connection", (socket) => {
       from: currentUser,
       to: to,
       message,
+      fileData,
       timestamp,
       type: 'private'
     };
@@ -95,7 +180,7 @@ io.on("connection", (socket) => {
   });
 
   // Enviar mensagem em grupo
-  socket.on("send_group", ({ roomId, message }) => {
+  socket.on("send_group", ({ roomId, message, fileData }) => {
     const room = rooms.get(roomId);
     if (!room || !room.members.includes(currentUser)) {
       return;
@@ -111,6 +196,7 @@ io.on("connection", (socket) => {
       from: currentUser,
       roomId,
       message,
+      fileData,
       timestamp,
       type: 'group'
     };
@@ -194,8 +280,6 @@ io.on("connection", (socket) => {
         });
       }
     });
-
-    console.log(`Grupo "${groupName}" criado por ${currentUser}`);
   });
 
   // Atualizar status do usuário
@@ -232,7 +316,6 @@ io.on("connection", (socket) => {
       users.set(currentUser, user);
 
       sendUserLists();
-      console.log(`${currentUser} desconectou-se`);
     }
   });
 
