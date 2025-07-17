@@ -5,15 +5,56 @@ const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs-extra");
+require('dotenv').config();
+
+// Importar classes da nossa arquitetura
+const DatabaseConnection = require('./database/connection');
+const UserRepository = require('./repositories/UserRepository');
+const RoomRepository = require('./repositories/RoomRepository');
+const MessageRepository = require('./repositories/MessageRepository');
+const AuthService = require('./services/AuthService');
+const {
+  authenticateToken,
+  authenticateSocket,
+  rateLimiter,
+  requestLogger,
+  corsMiddleware
+} = require('./middleware/auth');
 
 const app = express();
-app.use(cors());
+
+// Middlewares básicos
+app.use(requestLogger);
+app.use(corsMiddleware);
 app.use(express.json());
+
+// Conectar ao banco de dados
+let db, userRepository, roomRepository, messageRepository, authService;
+
+async function initializeDatabase() {
+  try {
+    db = await DatabaseConnection.connect();
+    const dbType = DatabaseConnection.getType();
+
+    // Inicializar repositories
+    userRepository = new UserRepository(db, dbType);
+    roomRepository = new RoomRepository(db, dbType);
+    messageRepository = new MessageRepository(db, dbType);
+
+    // Inicializar serviços
+    authService = new AuthService(userRepository);
+
+    console.log('✅ Sistema de banco de dados inicializado');
+  } catch (error) {
+    console.error('❌ Erro ao conectar banco de dados:', error);
+    process.exit(1);
+  }
+}
 
 // Configuração do multer para upload de arquivos
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadPath = path.join(__dirname, 'uploads');
+    const uploadPath = path.join(__dirname, process.env.UPLOAD_PATH || 'uploads');
     fs.ensureDirSync(uploadPath);
     cb(null, uploadPath);
   },
@@ -25,7 +66,6 @@ const storage = multer.diskStorage({
 });
 
 const fileFilter = (req, file, cb) => {
-  // Aceitar apenas imagens, documentos e alguns outros tipos
   const allowedTypes = [
     'image/jpeg', 'image/png', 'image/gif', 'image/webp',
     'application/pdf', 'text/plain',
@@ -44,47 +84,132 @@ const upload = multer({
   storage: storage,
   fileFilter: fileFilter,
   limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB máximo
+    fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10 * 1024 * 1024 // 10MB padrão
   }
 });
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: ["http://localhost:5173", "http://localhost:3000"],
+    credentials: true
   },
 });
 
-const users = new Map(); // username -> { socketId, online, avatar, lastSeen }
-const rooms = new Map(); // roomId -> { name, members, messages, type: 'private' | 'group' }
-const messageHistory = new Map(); // userId -> [messages]
+// Middleware para servir arquivos estáticos
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Middleware para servir arquivos estáticos (avatars, etc.)
-app.use('/uploads', express.static('uploads'));
-
-// API Routes
-app.get('/api/users', (req, res) => {
-  const userList = Array.from(users.entries()).map(([username, data]) => ({
-    username,
-    online: data.online,
-    lastSeen: data.lastSeen,
-    avatar: data.avatar
-  }));
-  res.json(userList);
+// ===== ROTAS DE AUTENTICAÇÃO =====
+app.post('/api/auth/register', rateLimiter(5, 15 * 60 * 1000), async (req, res) => {
+  try {
+    const result = await authService.register(req.body);
+    res.status(201).json({
+      success: true,
+      message: 'Usuário registrado com sucesso',
+      data: result
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
-app.get('/api/rooms', (req, res) => {
-  const roomList = Array.from(rooms.entries()).map(([id, room]) => ({
-    id,
-    name: room.name,
-    type: room.type,
-    memberCount: room.members.length
-  }));
-  res.json(roomList);
+app.post('/api/auth/login', rateLimiter(10, 15 * 60 * 1000), async (req, res) => {
+  try {
+    const result = await authService.login(req.body);
+    res.json({
+      success: true,
+      message: 'Login realizado com sucesso',
+      data: result
+    });
+  } catch (error) {
+    res.status(401).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/api/auth/logout', authenticateToken(authService), async (req, res) => {
+  try {
+    await authService.logout(req.user.id);
+    res.json({
+      success: true,
+      message: 'Logout realizado com sucesso'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const { token } = req.body;
+    const result = await authService.refreshToken(token);
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    res.status(401).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/auth/me', authenticateToken(authService), async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      data: { user: req.user }
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ===== ROTAS DA API =====
+app.get('/api/users', authenticateToken(authService), async (req, res) => {
+  try {
+    const users = await userRepository.findAll(req.user.id);
+    res.json({
+      success: true,
+      data: users
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/rooms', authenticateToken(authService), async (req, res) => {
+  try {
+    const rooms = await roomRepository.findUserRooms(req.user.id);
+    res.json({
+      success: true,
+      data: rooms
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 // Route para upload de arquivos
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', authenticateToken(authService), upload.single('file'), (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'Nenhum arquivo foi enviado' });
@@ -110,7 +235,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 });
 
 // Route para deletar arquivos
-app.delete('/api/upload/:filename', (req, res) => {
+app.delete('/api/upload/:filename', authenticateToken(authService), (req, res) => {
   try {
     const filename = req.params.filename;
     const filePath = path.join(__dirname, 'uploads', filename);
@@ -127,233 +252,322 @@ app.delete('/api/upload/:filename', (req, res) => {
   }
 });
 
-io.on("connection", (socket) => {
-  let currentUser = null;
-  let currentRoom = null;
+// ===== SOCKET.IO COM AUTENTICAÇÃO =====
 
-  // Registrar nome de usuário
-  socket.on("set_username", ({ username, avatar }) => {
-    currentUser = username;
-    users.set(username, {
-      socketId: socket.id,
-      online: true,
-      avatar: avatar || null,
-      lastSeen: new Date().toISOString()
-    });
+// Middleware de autenticação para Socket.IO
+io.use(authenticateSocket(authService));
 
-    // Enviar histórico de mensagens para o usuário
-    const userMessages = messageHistory.get(username) || [];
-    socket.emit("message_history", userMessages);
+// Map para rastrear usuários conectados (userId -> socketId)
+const connectedUsers = new Map();
 
-    sendUserLists();
-  });
+// Função para broadcast da lista de usuários
+async function broadcastUsersList() {
+  try {
+    const onlineUsers = await userRepository.findOnlineUsers();
+    io.emit("user_list", onlineUsers);
+  } catch (error) {
+    console.error("Erro ao enviar lista de usuários:", error);
+  }
+}
+
+io.on("connection", async (socket) => {
+  const user = socket.user;
+  console.log(`✅ Usuário conectado: ${user.username} (ID: ${user.id})`);
+
+  // Atualizar status online
+  await userRepository.updateOnlineStatus(user.id, true);
+  connectedUsers.set(user.id, socket.id);
+
+  // Enviar lista de usuários online para todos
+  await broadcastUsersList();
+
+  // Buscar e enviar histórico de mensagens do usuário
+  const userRooms = await roomRepository.findUserRooms(user.id);
+  for (const room of userRooms) {
+    const messages = await messageRepository.findByRoom(room.id, 50);
+    socket.emit("room_history", { roomId: room.id, messages });
+  }
+
+  // ===== EVENTOS DE MENSAGENS =====
 
   // Enviar mensagem privada
-  socket.on("send_private", ({ to, message, fileData }) => {
-    const timestamp = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+  socket.on("send_private", async ({ to, message, fileData }) => {
+    try {
+      // Buscar usuário destinatário
+      const targetUser = await userRepository.findByUsername(to);
+      if (!targetUser) {
+        socket.emit("error", { message: "Usuário não encontrado" });
+        return;
+      }
 
-    const payload = {
-      id: Date.now() + Math.random(),
-      from: currentUser,
-      to: to,
-      message,
-      fileData,
-      timestamp,
-      type: 'private'
-    };
+      // Criar ou encontrar sala privada
+      const room = await roomRepository.createOrFindPrivateRoom(user.id, targetUser.id);
 
-    // Salvar no histórico
-    saveMessage(currentUser, payload);
-    saveMessage(to, payload);
+      // Salvar mensagem no banco
+      const messageData = {
+        room_id: room.id,
+        user_id: user.id,
+        content: message,
+        message_type: fileData ? 'file' : 'text',
+        file_data: fileData || null
+      };
 
-    // Envia para o destinatário
-    const target = users.get(to);
-    if (target?.online) {
-      io.to(target.socketId).emit("receive_private", payload);
+      const savedMessage = await messageRepository.create(messageData);
+
+      const payload = {
+        id: savedMessage.id,
+        from: user.username,
+        to: to,
+        message,
+        fileData,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        type: 'private'
+      };
+
+      // Enviar para o destinatário se estiver online
+      const targetSocketId = connectedUsers.get(targetUser.id);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit("receive_private", payload);
+      }
+
+      // Confirmar envio para o remetente
+      socket.emit("message_sent", payload);
+
+    } catch (error) {
+      console.error("Erro ao enviar mensagem privada:", error);
+      socket.emit("error", { message: "Erro ao enviar mensagem" });
     }
-
-    // Confirma para o remetente
-    socket.emit("message_sent", payload);
   });
 
   // Enviar mensagem em grupo
-  socket.on("send_group", ({ roomId, message, fileData }) => {
-    const room = rooms.get(roomId);
-    if (!room || !room.members.includes(currentUser)) {
-      return;
-    }
-
-    const timestamp = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-
-    const payload = {
-      id: Date.now() + Math.random(),
-      from: currentUser,
-      roomId,
-      message,
-      fileData,
-      timestamp,
-      type: 'group'
-    };
-
-    // Salvar mensagem no grupo
-    room.messages.push(payload);
-
-    // Enviar para todos os membros do grupo
-    room.members.forEach(member => {
-      const user = users.get(member);
-      if (user?.online) {
-        io.to(user.socketId).emit("receive_group", payload);
+  socket.on("send_group", async ({ roomId, message, fileData }) => {
+    try {
+      // Verificar se usuário é membro da sala
+      if (!await roomRepository.isMember(roomId, user.id)) {
+        socket.emit("error", { message: "Você não é membro deste grupo" });
+        return;
       }
-    });
+
+      // Salvar mensagem no banco
+      const messageData = {
+        room_id: roomId,
+        user_id: user.id,
+        content: message,
+        message_type: fileData ? 'file' : 'text',
+        file_data: fileData || null
+      };
+
+      const savedMessage = await messageRepository.create(messageData);
+
+      const payload = {
+        id: savedMessage.id,
+        from: user.username,
+        roomId,
+        message,
+        fileData,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        type: 'group'
+      };
+
+      // Buscar membros do grupo e enviar mensagem
+      const members = await roomRepository.getRoomMembers(roomId);
+      members.forEach(member => {
+        const memberSocketId = connectedUsers.get(member.id);
+        if (memberSocketId) {
+          io.to(memberSocketId).emit("receive_group", payload);
+        }
+      });
+
+    } catch (error) {
+      console.error("Erro ao enviar mensagem em grupo:", error);
+      socket.emit("error", { message: "Erro ao enviar mensagem" });
+    }
+  });
+
+  // Criar grupo
+  socket.on("create_group", async ({ groupName, members }) => {
+    try {
+      // Criar sala
+      const room = await roomRepository.create({
+        name: groupName,
+        type: 'group',
+        created_by: user.id
+      });
+
+      // Adicionar criador
+      await roomRepository.addMember(room.id, user.id);
+
+      // Adicionar membros
+      for (const memberUsername of members) {
+        const member = await userRepository.findByUsername(memberUsername);
+        if (member) {
+          await roomRepository.addMember(room.id, member.id);
+
+          // Notificar membro se estiver online
+          const memberSocketId = connectedUsers.get(member.id);
+          if (memberSocketId) {
+            io.to(memberSocketId).emit("group_created", {
+              roomId: room.id,
+              groupName,
+              members: [user.username, ...members],
+              createdBy: user.username
+            });
+          }
+        }
+      }
+
+      // Notificar criador
+      socket.emit("group_created", {
+        roomId: room.id,
+        groupName,
+        members: [user.username, ...members],
+        createdBy: user.username
+      });
+
+    } catch (error) {
+      console.error("Erro ao criar grupo:", error);
+      socket.emit("error", { message: "Erro ao criar grupo" });
+    }
   });
 
   // Entrar em uma sala
-  socket.on("join_room", (roomId) => {
-    currentRoom = roomId;
-    socket.join(roomId);
+  socket.on("join_room", async (roomId) => {
+    try {
+      // Verificar se usuário é membro
+      if (await roomRepository.isMember(roomId, user.id)) {
+        socket.join(roomId);
 
-    const room = rooms.get(roomId);
-    if (room) {
-      socket.emit("room_history", room.messages);
+        // Enviar histórico da sala
+        const messages = await messageRepository.findByRoom(roomId, 50);
+        socket.emit("room_history", messages);
+      } else {
+        socket.emit("error", { message: "Acesso negado a esta sala" });
+      }
+    } catch (error) {
+      console.error("Erro ao entrar na sala:", error);
+      socket.emit("error", { message: "Erro ao entrar na sala" });
     }
   });
 
   // Sair de uma sala
   socket.on("leave_room", (roomId) => {
     socket.leave(roomId);
-    currentRoom = null;
   });
 
   // Indicador de "digitando"
-  socket.on("typing", ({ to, roomId }) => {
-    if (to) {
-      // Mensagem privada
-      const target = users.get(to);
-      if (target?.online) {
-        io.to(target.socketId).emit("typing", { from: currentUser, type: 'private' });
+  socket.on("typing", async ({ to, roomId }) => {
+    try {
+      if (to) {
+        // Mensagem privada
+        const targetUser = await userRepository.findByUsername(to);
+        if (targetUser) {
+          const targetSocketId = connectedUsers.get(targetUser.id);
+          if (targetSocketId) {
+            io.to(targetSocketId).emit("typing", { from: user.username, type: 'private' });
+          }
+        }
+      } else if (roomId) {
+        // Mensagem em grupo
+        if (await roomRepository.isMember(roomId, user.id)) {
+          socket.to(roomId).emit("typing", { from: user.username, type: 'group', roomId });
+        }
       }
-    } else if (roomId) {
-      // Mensagem em grupo
-      socket.to(roomId).emit("typing", { from: currentUser, type: 'group', roomId });
+    } catch (error) {
+      console.error("Erro no indicador de digitação:", error);
     }
   });
 
-  socket.on("stop_typing", ({ to, roomId }) => {
-    if (to) {
-      const target = users.get(to);
-      if (target?.online) {
-        io.to(target.socketId).emit("stop_typing", { from: currentUser, type: 'private' });
+  socket.on("stop_typing", async ({ to, roomId }) => {
+    try {
+      if (to) {
+        const targetUser = await userRepository.findByUsername(to);
+        if (targetUser) {
+          const targetSocketId = connectedUsers.get(targetUser.id);
+          if (targetSocketId) {
+            io.to(targetSocketId).emit("stop_typing", { from: user.username, type: 'private' });
+          }
+        }
+      } else if (roomId) {
+        if (await roomRepository.isMember(roomId, user.id)) {
+          socket.to(roomId).emit("stop_typing", { from: user.username, type: 'group', roomId });
+        }
       }
-    } else if (roomId) {
-      socket.to(roomId).emit("stop_typing", { from: currentUser, type: 'group', roomId });
+    } catch (error) {
+      console.error("Erro ao parar indicador de digitação:", error);
     }
-  });
-
-  // Criar grupo
-  socket.on("create_group", ({ groupName, members }) => {
-    const roomId = `group_${Date.now()}`;
-    const allMembers = [...members, currentUser];
-
-    rooms.set(roomId, {
-      name: groupName,
-      members: allMembers,
-      messages: [],
-      type: 'group',
-      createdBy: currentUser,
-      createdAt: new Date().toISOString()
-    });
-
-    allMembers.forEach((member) => {
-      const user = users.get(member);
-      if (user?.online) {
-        io.to(user.socketId).emit("group_created", {
-          roomId,
-          groupName,
-          members: allMembers,
-          createdBy: currentUser
-        });
-      }
-    });
   });
 
   // Atualizar status do usuário
-  socket.on("update_status", ({ status }) => {
-    if (currentUser && users.has(currentUser)) {
-      const user = users.get(currentUser);
-      user.status = status;
-      users.set(currentUser, user);
-      sendUserLists();
+  socket.on("update_status", async ({ status }) => {
+    try {
+      await userRepository.updateStatus(user.id, status);
+      await broadcastUsersList();
+    } catch (error) {
+      console.error("Erro ao atualizar status:", error);
     }
   });
 
   // Buscar mensagens
-  socket.on("search_messages", ({ query }) => {
-    const userMessages = messageHistory.get(currentUser) || [];
-    const filteredMessages = userMessages.filter(msg =>
-      msg.message.toLowerCase().includes(query.toLowerCase())
-    );
-    socket.emit("search_results", filteredMessages);
-  });
-
-  // Marcar mensagem como lida
-  socket.on("mark_as_read", ({ messageId }) => {
-    // Implementar lógica de leitura
-    console.log(`Mensagem ${messageId} marcada como lida por ${currentUser}`);
+  socket.on("search_messages", async ({ query }) => {
+    try {
+      const results = await messageRepository.searchMessages(query, user.id);
+      socket.emit("search_results", results);
+    } catch (error) {
+      console.error("Erro na busca:", error);
+      socket.emit("error", { message: "Erro na busca" });
+    }
   });
 
   // Desconexão
-  socket.on("disconnect", () => {
-    if (currentUser && users.has(currentUser)) {
-      const user = users.get(currentUser);
-      user.online = false;
-      user.lastSeen = new Date().toISOString();
-      users.set(currentUser, user);
+  socket.on("disconnect", async () => {
+    try {
+      console.log(`❌ Usuário desconectado: ${user.username} (ID: ${user.id})`);
 
-      sendUserLists();
+      // Atualizar status offline
+      await userRepository.updateOnlineStatus(user.id, false);
+      connectedUsers.delete(user.id);
+
+      // Enviar lista atualizada
+      await broadcastUsersList();
+    } catch (error) {
+      console.error("Erro na desconexão:", error);
     }
   });
-
-  // Funções auxiliares
-  function saveMessage(userId, message) {
-    if (!messageHistory.has(userId)) {
-      messageHistory.set(userId, []);
-    }
-    const messages = messageHistory.get(userId);
-    messages.push(message);
-
-    // Manter apenas as últimas 1000 mensagens
-    if (messages.length > 1000) {
-      messages.shift();
-    }
-
-    messageHistory.set(userId, messages);
-  }
-
-  // Envia listas de usuários atualizadas (excluindo a si mesmo)
-  function sendUserLists() {
-    for (const [username, data] of users.entries()) {
-      const userSocketId = data.socketId;
-      const filteredUsers = Array.from(users.entries())
-        .filter(([name]) => name !== username)
-        .map(([name, info]) => ({
-          username: name,
-          online: info.online,
-          lastSeen: info.lastSeen,
-          avatar: info.avatar,
-          status: info.status || 'available'
-        }));
-
-      io.to(userSocketId).emit("user_list", filteredUsers);
-    }
-  }
 });
 
-server.listen(3000, () => {
-  console.log("Servidor rodando na porta 3000");
+// Inicializar banco e depois iniciar servidor
+async function startServer() {
+  await initializeDatabase();
+
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => {
+    console.log(`🚀 Servidor rodando na porta ${PORT}`);
+    console.log(`📊 Banco de dados: ${DatabaseConnection.getType().toUpperCase()}`);
+    console.log(`🔐 Autenticação: JWT ativada`);
+    console.log(`📁 Upload de arquivos: Ativo`);
+  });
+}
+
+// Tratamento de erros não capturados
+process.on('uncaughtException', (error) => {
+  console.error('❌ Erro não capturado:', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Promise rejeitada não tratada:', reason);
+  process.exit(1);
+});
+
+// Fechar conexão do banco ao encerrar
+process.on('SIGINT', () => {
+  console.log('\n🔄 Encerrando servidor...');
+  DatabaseConnection.close();
+  process.exit(0);
+});
+
+// Iniciar servidor
+startServer().catch(error => {
+  console.error('❌ Erro ao iniciar servidor:', error);
+  process.exit(1);
 });
