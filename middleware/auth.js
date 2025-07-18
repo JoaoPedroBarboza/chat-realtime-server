@@ -4,20 +4,27 @@ const jwt = require('jsonwebtoken');
 const authenticateToken = (authService) => {
    return async (req, res, next) => {
       try {
+         console.log('🔐 Middleware - Verificando autenticação...');
          const authHeader = req.headers['authorization'];
+         console.log('🔐 Middleware - Authorization header:', authHeader ? 'presente' : 'ausente');
+
          const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
          if (!token) {
+            console.log('❌ Middleware - Token não fornecido');
             return res.status(401).json({
                error: 'Token de acesso requerido',
                code: 'NO_TOKEN'
             });
          }
 
+         console.log('🔐 Middleware - Token encontrado, validando...');
          const user = await authService.validateToken(token);
+         console.log('✅ Middleware - Usuário autenticado:', user.username);
          req.user = user;
          next();
       } catch (error) {
+         console.log('❌ Middleware - Erro na autenticação:', error.message);
          return res.status(403).json({
             error: 'Token inválido ou expirado',
             code: 'INVALID_TOKEN'
@@ -30,16 +37,25 @@ const authenticateToken = (authService) => {
 const authenticateSocket = (authService) => {
    return async (socket, next) => {
       try {
+         console.log('🔍 Socket auth - handshake completo:', JSON.stringify(socket.handshake, null, 2));
+         console.log('🔍 Socket auth - auth object:', socket.handshake.auth);
          const token = socket.handshake.auth.token;
 
          if (!token) {
+            console.log('❌ Socket auth - Token não fornecido');
+            console.log('🔍 Available handshake properties:', Object.keys(socket.handshake));
             return next(new Error('Token de acesso requerido'));
          }
 
+         console.log('🔍 Socket auth - Token recebido (primeiros 50 chars):', token.substring(0, 50) + '...');
+         console.log('🔍 Socket auth - Validando token...');
          const user = await authService.validateToken(token);
+         console.log('✅ Socket auth - Usuário autenticado:', user.username);
          socket.user = user;
          next();
       } catch (error) {
+         console.log('❌ Socket auth - Erro detalhado:', error);
+         console.log('❌ Socket auth - Stack trace:', error.stack);
          next(new Error('Token inválido ou expirado'));
       }
    };
